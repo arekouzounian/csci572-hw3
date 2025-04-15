@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::read_dir;
 use std::fs::File;
@@ -6,12 +7,8 @@ use std::io::{BufRead, BufWriter, Write};
 use std::sync::mpsc::channel;
 use std::thread;
 
-use regex::Regex;
-
-// TODO:
-//  - need to replace all punctuation and numerals with spaces
-//  - can do a first pass and save data intermediately
-//  - alternative: each mapper still splits on whitespace but also splits internal characters
+const UNIGRAM_FILENAME: &str = "unigram_index.txt";
+const BIGRAM_FILENAME: &str = "bigram_index.txt";
 
 fn unigram_gen(path: &str) {
     let dir = read_dir(path).expect("Invalid directory!");
@@ -36,8 +33,6 @@ fn unigram_gen(path: &str) {
         child_channels.push(main_send);
         let child_send_ch = child_send.clone();
         children.push(thread::spawn(move || {
-            let re = Regex::new(r"^[[:punct:]]+|[[:punct:]]+$").unwrap();
-
             for path in child_recv {
                 // do work
                 let f = File::open(path).unwrap();
@@ -52,21 +47,27 @@ fn unigram_gen(path: &str) {
 
                 for word in reader.split(b' ') {
                     // remove tabs
-                    let mut s = String::from_utf8(word.unwrap())
+                    let s = String::from_utf8(word.unwrap())
                         .expect("unable to parse string")
-                        .replace("\t", "");
+                        .replace(",", " ")
+                        .replace(".", " ")
+                        .replace("?", " ")
+                        .replace("!", " ")
+                        .to_lowercase();
 
-                    // remove punctuation
-                    s = re.replace(&s.trim(), "").to_string().to_lowercase();
-
-                    if s.len() < 1 {
+                    if s.is_empty() {
                         continue;
                     }
 
-                    // send work
-                    child_send_ch
-                        .send((s, filename.clone()))
-                        .expect("Error sending stuff back to main");
+                    // though we split on a space, the 'word' may have
+                    // contained punctuation that we've turned into a space.
+                    // So now we need to iterate through the inner subwords & send each.
+                    for subword in s.split_ascii_whitespace() {
+                        // send work
+                        child_send_ch
+                            .send((subword.to_string(), filename.clone()))
+                            .expect("Error sending stuff back to main");
+                    }
                 }
             }
         }))
@@ -101,6 +102,7 @@ fn unigram_gen(path: &str) {
         }
 
         let idx = map.get_mut(&word).unwrap();
+
         if idx.contains_key(&doc) {
             let val = idx.get_mut(&doc).unwrap();
             *val += 1;
@@ -111,7 +113,7 @@ fn unigram_gen(path: &str) {
 
     println!("reduction complete. writing...");
 
-    let mut out_file = BufWriter::new(File::create("unigrams.txt").unwrap());
+    let mut out_file = BufWriter::new(File::create(UNIGRAM_FILENAME).unwrap());
 
     for (wrd, dict) in map {
         // println!("{}", wrd);
@@ -156,8 +158,6 @@ fn bigram_gen(path: &str) {
         child_channels.push(main_send);
         let child_send_ch = child_send.clone();
         children.push(thread::spawn(move || {
-            let re = Regex::new(r"^[[:punct:]]+|[[:punct:]]+$").unwrap();
-
             for path in child_recv {
                 // do work
                 let f = File::open(path).unwrap();
@@ -174,32 +174,61 @@ fn bigram_gen(path: &str) {
 
                 for word in reader.split(b' ') {
                     // remove tabs
-                    let mut s = String::from_utf8(word.unwrap())
+                    let s = String::from_utf8(word.unwrap())
                         .expect("unable to parse string")
-                        .replace("\t", "");
+                        .replace("\t", "")
+                        .replace(",", " ")
+                        .replace(".", " ")
+                        .replace("?", " ")
+                        .replace("!", " ")
+                        .to_lowercase();
 
-                    // remove punctuation
-                    s = re.replace(&s.trim(), "").to_string().to_lowercase();
-
-                    if s.len() < 1 {
+                    if s.is_empty() {
                         continue;
                     }
 
-                    if let Some(p) = prv_wrd {
-                        let tmp = s.clone();
+                    match prv_wrd {
+                        None => {
+                            let mut it = s.split_ascii_whitespace();
+                            let first = it.next();
+                            if first.is_none() {
+                                continue;
+                            }
 
-                        s = p + " " + &s;
+                            let mut first = first.unwrap();
 
-                        prv_wrd = Some(tmp);
-                    } else {
-                        prv_wrd = Some(s);
-                        continue;
+                            for word in it {
+                                child_send_ch
+                                    .send((first.to_owned() + " " + word, filename.clone()))
+                                    .expect("Error sending first words back to main");
+
+                                first = word;
+                            }
+
+                            prv_wrd = Some(first.to_owned());
+                        }
+                        Some(p) => {
+                            let mut curr = p;
+
+                            for subword in s.split_ascii_whitespace() {
+                                child_send_ch
+                                    .send((curr + " " + subword, filename.clone()))
+                                    .expect("Error sending first words back to main");
+
+                                curr = subword.to_owned();
+                            }
+
+                            prv_wrd = Some(curr);
+                        }
                     }
 
-                    // send work
-                    child_send_ch
-                        .send((s, filename.clone()))
-                        .expect("Error sending stuff back to main");
+                    for subword in s.split_ascii_whitespace() {
+                        // send work
+
+                        child_send_ch
+                            .send((subword.to_string(), filename.clone()))
+                            .expect("Error sending stuff back to main");
+                    }
                 }
             }
         }))
@@ -244,7 +273,7 @@ fn bigram_gen(path: &str) {
 
     println!("reduction complete. writing...");
 
-    let mut out_file = BufWriter::new(File::create("bigrams.txt").unwrap());
+    let mut out_file = BufWriter::new(File::create(BIGRAM_FILENAME).unwrap());
 
     for (wrd, dict) in map {
         // println!("{}", wrd);
@@ -267,8 +296,9 @@ fn bigram_gen(path: &str) {
 }
 
 fn main() {
-    let file = "fulldata";
+    let unigram_file = "fulldata";
+    let bigram_file = "devdata";
 
-    unigram_gen(file);
-    bigram_gen(file);
+    unigram_gen(unigram_file);
+    bigram_gen(bigram_file);
 }
